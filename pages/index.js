@@ -44,6 +44,7 @@ export default function Home() {
   const mono = {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     wordBreak: "break-all",
+    whiteSpace: "pre-wrap",
     background: "#f7f7f7",
     padding: 10,
     borderRadius: 6,
@@ -55,17 +56,17 @@ export default function Home() {
     marginBottom: 10
   }
 
-  const badge = (ok) => ({
+  const pill = (text, good = true) => ({
     display: "inline-block",
     padding: "4px 10px",
     borderRadius: 999,
-    background: ok ? "#e8f7ec" : "#fdecec",
-    color: ok ? "#176b2c" : "#9f1d1d",
+    background: good ? "#e8f7ec" : "#fdecec",
+    color: good ? "#176b2c" : "#9f1d1d",
     fontWeight: 700
   })
 
   return (
-    <div style={{ fontFamily: "sans-serif", padding: 24, maxWidth: 980, margin: "0 auto" }}>
+    <div style={{ fontFamily: "sans-serif", padding: 24, maxWidth: 1000, margin: "0 auto" }}>
       <h1>MailAuth DNS Checker</h1>
 
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 20 }}>
@@ -104,8 +105,15 @@ export default function Home() {
 
           <p>
             <strong>Mail Security Score:</strong>{" "}
-            <span style={badge(result.securityScore >= 75)}>
+            <span style={pill(result.securityScore >= 75, result.securityScore >= 75)}>
               {result.securityScore} / 100 ({result.securityGrade})
+            </span>
+          </p>
+
+          <p>
+            <strong>Deliverability Score:</strong>{" "}
+            <span style={pill(result.deliverabilityScore >= 70, result.deliverabilityScore >= 70)}>
+              {result.deliverabilityScore} / 100 ({result.deliverabilityLabel})
             </span>
           </p>
 
@@ -132,11 +140,20 @@ export default function Home() {
             <div style={mono}>not found</div>
           )}
 
+          <h4 style={{ marginTop: 12 }}>SPF Flatten Candidate</h4>
+          <div style={mono}>{result.spfRecursive?.flattenedCandidate || "not generated"}</div>
+
           <h3 style={h3}>DKIM</h3>
           <p>DKIM : {result.dkim ? "OK" : "NG"}</p>
           <p>Selector : {result.dkimSelector || "not found"}</p>
           <p>Host : {result.dkimHost || "not found"}</p>
           <p>Tried Selectors : {result.dkimTriedCount}</p>
+          <p>
+            Key Strength :{" "}
+            {result.dkimKeyStrength?.bitsEstimate
+              ? `${result.dkimKeyStrength.bitsEstimate} bit (${result.dkimKeyStrength.rating})`
+              : result.dkimKeyStrength?.rating || "unknown"}
+          </p>
           <div style={mono}>{result.dkimRecord || "not found"}</div>
 
           <h4 style={{ marginTop: 12 }}>DKIM TXT Parsed Tags</h4>
@@ -155,6 +172,13 @@ export default function Home() {
           <p>Policy : {result.dmarcPolicy}</p>
           <div style={mono}>{result.dmarcRecord || "not found"}</div>
 
+          <h4 style={{ marginTop: 12 }}>DMARC rua / ruf</h4>
+          <div style={mono}>
+            rua: {result.rua?.length ? result.rua.join(", ") : "not found"}
+            {"\n"}
+            ruf: {result.ruf?.length ? result.ruf.join(", ") : "not found"}
+          </div>
+
           <h4 style={{ marginTop: 12 }}>DMARC Alignment</h4>
           <p>SPF Aligned : {result.dmarcAlignment?.spfAligned ? "YES" : "NO"}</p>
           <p>DKIM Aligned : {result.dmarcAlignment?.dkimAligned ? "YES" : "NO"}</p>
@@ -163,6 +187,7 @@ export default function Home() {
 
           <h3 style={h3}>MX</h3>
           <p>MX : {result.mx ? "OK" : "NG"}</p>
+          <p>MX Found On : {result.mxFoundOn || "not found"}</p>
           {result.mxHosts?.length > 0 ? (
             <div style={mono}>
               {result.mxHosts.map((mx, idx) => (
@@ -210,25 +235,48 @@ export default function Home() {
           <p style={{ marginTop: 8 }}><strong>Policy URL</strong></p>
           <div style={mono}>{result.mtaStsPolicyUrl}</div>
 
-          <h3 style={h3}>SMTP TLS</h3>
+          <h4 style={{ marginTop: 12 }}>MTA-STS Policy Fetch</h4>
+          <div style={mono}>
+            fetched: {result.mtaStsPolicy?.fetched ? "yes" : "no"}
+            {"\n"}
+            ok: {result.mtaStsPolicy?.ok ? "yes" : "no"}
+            {"\n"}
+            status: {result.mtaStsPolicy?.status}
+            {"\n\n"}
+            {result.mtaStsPolicy?.body || result.mtaStsPolicy?.error || "not fetched"}
+          </div>
+
+          <h3 style={h3}>SMTP TLS Handshake</h3>
           <p>Checked : {result.smtpTls?.checked ? "YES" : "NO"}</p>
           <p>Supported : {result.smtpTls?.supported ? "YES" : "NO"}</p>
           <p>Mode : {result.smtpTls?.mode}</p>
           <div style={mono}>{result.smtpTls?.note}</div>
 
+          <h4 style={{ marginTop: 12 }}>SMTP TLS Probe Detail</h4>
+          <div style={mono}>
+            {result.smtpTls?.probes?.length
+              ? result.smtpTls.probes.map((p, i) =>
+                  `[${i + 1}] host=${p.host} port=${p.port} ok=${p.ok} protocol=${p.protocol || "-"} error=${p.error || "-"}`
+                ).join("\n")
+              : "no probe detail"}
+          </div>
+
           <h3 style={h3}>Security</h3>
           <p>Blacklist : {result.blacklist ? "LISTED" : "CLEAR"}</p>
 
-          <h4 style={{ marginTop: 12 }}>Score Notes</h4>
-          {result.securityNotes?.length > 0 ? (
-            <div style={mono}>
-              {result.securityNotes.map((n, i) => (
-                <div key={i}>- {n}</div>
-              ))}
-            </div>
-          ) : (
-            <div style={mono}>no major issues</div>
-          )}
+          <h4 style={{ marginTop: 12 }}>Security Notes</h4>
+          <div style={mono}>
+            {result.securityNotes?.length
+              ? result.securityNotes.map(n => `- ${n}`).join("\n")
+              : "no major issues"}
+          </div>
+
+          <h4 style={{ marginTop: 12 }}>Deliverability Reasons</h4>
+          <div style={mono}>
+            {result.deliverabilityReasons?.length
+              ? result.deliverabilityReasons.map(n => `- ${n}`).join("\n")
+              : "no major issues"}
+          </div>
         </div>
       )}
     </div>

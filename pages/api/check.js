@@ -1,156 +1,162 @@
 import dns from "dns/promises"
 
-export default async function handler(req,res){
+export default async function handler(req, res) {
 
-const {domain} = req.body
+  let domain = ""
 
-let spf=false
-let dmarc=false
-let dkim=false
-let mx=false
+  if (req.method === "POST") {
+    domain = req.body?.domain || ""
+  }
 
-let spfLookups=0
-let dmarcPolicy="none"
-let dkimSelector=null
+  if (!domain) {
+    res.json({error:"domain required"})
+    return
+  }
 
-// --------------------
-// SPF
-// --------------------
+  let spf=false
+  let dmarc=false
+  let dkim=false
+  let mx=false
 
-try{
+  let spfLookups=0
+  let dmarcPolicy="none"
+  let dkimSelector=null
 
-const txt = await dns.resolveTxt(domain)
+  // --------------------
+  // SPF
+  // --------------------
 
-txt.forEach(r=>{
+  try{
 
-const record = r.join("")
+    const txt = await dns.resolveTxt(domain)
 
-if(record.includes("v=spf1")){
+    txt.forEach(r=>{
 
-spf=true
+      const record = r.join("")
 
-const matches = record.match(/include:/g)
+      if(record.includes("v=spf1")){
 
-if(matches){
-spfLookups = matches.length
-}
+        spf=true
 
-}
+        const matches = record.match(/include:/g)
 
-})
+        if(matches){
+          spfLookups = matches.length
+        }
 
-}catch{}
+      }
 
+    })
 
-// --------------------
-// DMARC
-// --------------------
-
-try{
-
-const txt = await dns.resolveTxt("_dmarc."+domain)
-
-txt.forEach(r=>{
-
-const record = r.join("")
-
-if(record.includes("v=DMARC1")){
-
-dmarc=true
-
-const p = record.match(/p=([^;]+)/)
-
-if(p){
-dmarcPolicy=p[1]
-}
-
-}
-
-})
-
-}catch{}
+  }catch(e){}
 
 
-// --------------------
-// DKIM selector search
-// --------------------
+  // --------------------
+  // DMARC
+  // --------------------
 
-const selectors=[
-"selector1",
-"selector2",
-"google",
-"k1",
-"default"
-]
+  try{
 
-for(const s of selectors){
+    const txt = await dns.resolveTxt("_dmarc."+domain)
 
-try{
+    txt.forEach(r=>{
 
-await dns.resolveTxt(s+"._domainkey."+domain)
+      const record = r.join("")
 
-dkim=true
-dkimSelector=s
-break
+      if(record.includes("v=DMARC1")){
 
-}catch{}
+        dmarc=true
 
-}
+        const p = record.match(/p=([^;]+)/)
 
+        if(p){
+          dmarcPolicy=p[1]
+        }
 
-// --------------------
-// MX
-// --------------------
+      }
 
-try{
+    })
 
-await dns.resolveMx(domain)
-mx=true
-
-}catch{}
+  }catch(e){}
 
 
-// --------------------
-// Blacklist check
-// --------------------
+  // --------------------
+  // DKIM selector search
+  // --------------------
 
-let blacklist=false
+  const selectors=[
+    "selector1",
+    "selector2",
+    "google",
+    "k1",
+    "default"
+  ]
 
-try{
+  for(const s of selectors){
 
-const reversedIP="127.0.0.2"
+    try{
 
-await dns.resolve4(reversedIP+".zen.spamhaus.org")
+      await dns.resolveTxt(s+"._domainkey."+domain)
 
-blacklist=true
+      dkim=true
+      dkimSelector=s
+      break
 
-}catch{}
+    }catch(e){}
 
-
-// --------------------
-// Gmail / Outlook判定
-// --------------------
-
-const gmailPass = spf && dkim && dmarc
-const outlookPass = spf && dkim && dmarc
+  }
 
 
-res.json({
+  // --------------------
+  // MX
+  // --------------------
 
-spf,
-dkim,
-dmarc,
-mx,
+  try{
 
-spfLookups,
-dmarcPolicy,
-dkimSelector,
+    await dns.resolveMx(domain)
+    mx=true
 
-gmailPass,
-outlookPass,
+  }catch(e){}
 
-blacklist
 
-})
+  // --------------------
+  // Blacklist check
+  // --------------------
+
+  let blacklist=false
+
+  try{
+
+    await dns.resolve4("127.0.0.2.zen.spamhaus.org")
+    blacklist=true
+
+  }catch(e){}
+
+
+  // --------------------
+  // Gmail / Outlook判定
+  // --------------------
+
+  const gmailPass = spf && dkim && dmarc
+  const outlookPass = spf && dkim && dmarc
+
+
+  res.json({
+
+    spf,
+    dkim,
+    dmarc,
+    mx,
+
+    spfLookups,
+    dmarcPolicy,
+    dkimSelector,
+
+    gmailPass,
+    outlookPass,
+
+    blacklist
+
+  })
 
 }

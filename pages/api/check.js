@@ -1,4 +1,10 @@
 import dns from "dns/promises"
+import tls from "tls"
+import https from "https"
+
+/* -----------------------------
+ utils
+------------------------------*/
 
 function uniq(arr) {
   return [...new Set(arr)]
@@ -31,20 +37,30 @@ function extractRootDomain(domain) {
   if (parts.length <= 2) return domain
 
   const last2 = parts.slice(-2).join(".")
-  const jp3 = parts.slice(-3).join(".")
+  const last3 = parts.slice(-3).join(".")
 
-  const jpPublicSuffix2 = [
-    "co.jp", "or.jp", "ne.jp", "ac.jp", "ad.jp", "ed.jp", "go.jp", "gr.jp", "lg.jp"
+  const jpSuffix = [
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "ad.jp",
+    "ed.jp", "go.jp", "gr.jp", "lg.jp"
   ]
 
-  if (jpPublicSuffix2.includes(last2) && parts.length >= 3) {
-    return jp3
+  if (jpSuffix.includes(last2) && parts.length >= 3) {
+    return last3
   }
 
   return last2
 }
 
-function countDirectSpfLookups(record) {
+async function getTxtRecords(name) {
+  const txt = await dns.resolveTxt(name)
+  return txt.map(r => r.join(""))
+}
+
+/* -----------------------------
+ SPF
+------------------------------*/
+
+function countSpfLookups(record) {
   const patterns = [
     /include:/gi,
     /\ba(?=[:\s]|$)/gi,
@@ -67,9 +83,14 @@ function getSpfIncludes(record) {
   return uniq(matches.map(m => m[1].trim()).filter(Boolean))
 }
 
-async function getTxtRecords(name) {
-  const txt = await dns.resolveTxt(name)
-  return txt.map(r => r.join(""))
+function flattenSpfRecord(record, includeRecords) {
+  let flattened = record
+
+  for (const inc of includeRecords) {
+    flattened += `  # include:${inc.domain} => ${inc.record}`
+  }
+
+  return flattened
 }
 
 async function resolveSpfRecursive(domain, visited = new Set(), depth = 0, maxDepth = 10) {
@@ -77,10 +98,10 @@ async function resolveSpfRecursive(domain, visited = new Set(), depth = 0, maxDe
     found: false,
     record: "",
     includes: [],
-    visited: [],
     totalLookups: 0,
     warning: false,
     tree: [],
+    includeRecords: [],
     errors: []
   }
 
@@ -96,20 +117,17 @@ async function resolveSpfRecursive(domain, visited = new Set(), depth = 0, maxDe
   }
 
   visited.add(key)
-  result.visited = [...visited]
 
   try {
     const records = await getTxtRecords(domain)
     const spfRecord = records.find(r => r.toLowerCase().includes("v=spf1"))
 
-    if (!spfRecord) {
-      return result
-    }
+    if (!spfRecord) return result
 
     result.found = true
     result.record = spfRecord
 
-    const directLookups = countDirectSpfLookups(spfRecord)
+    const directLookups = countSpfLookups(spfRecord)
     const includes = getSpfIncludes(spfRecord)
 
     result.includes = includes
@@ -125,10 +143,16 @@ async function resolveSpfRecursive(domain, visited = new Set(), depth = 0, maxDe
       const child = await resolveSpfRecursive(inc, visited, depth + 1, maxDepth)
       result.totalLookups += child.totalLookups
       result.tree.push(...child.tree)
+      result.includeRecords.push(
+        ...(child.record ? [{ domain: inc, record: child.record }] : [])
+      )
+      result.includeRecords.push(...(child.includeRecords || []))
       result.errors.push(...child.errors)
     }
 
     result.warning = result.totalLookups > 10
+    result.flattenedCandidate = flattenSpfRecord(spfRecord, result.includeRecords)
+
     return result
   } catch (e) {
     result.errors.push(`${domain}: ${String(e.message || e)}`)
@@ -136,22 +160,23 @@ async function resolveSpfRecursive(domain, visited = new Set(), depth = 0, maxDe
   }
 }
 
-function buildSelectorList(domain) {
+/* -----------------------------
+ DKIM
+------------------------------*/
+
+function buildSelectors(domain) {
   const local = domain.split(".")[0] || "default"
 
   const common = [
-    "selector1","selector2","selector3","selector4","selector5",
-    "default","google","k1","k2","dkim","mail","smtp","mx","s1","s2",
-    "zendesk","sendgrid","sg","mg","mandrill","mailgun","amazonses","ses",
-    "sparkpost","postmark","pm","brevo","sendinblue","hubspot","hs1","hs2",
-    "zoho","zmail","outlook","microsoft","ms","o365","office365","protection",
-    "gmail","gworkspace","workspace","googleworkspace",
-    "mailer","newsletter","news","campaign","bulk","bounce","transactional",
-    "pmta","mta","relay","postfix","exim","qmail","smtp1","smtp2",
-    "dkim1","dkim2","dkim3",
-    "selector01","selector02","selector03","selector10",
-    "alpha","beta","prod","stage","test",
-    "x","y","z",
+    "selector1", "selector2", "selector3", "selector4", "selector5",
+    "default", "google", "k1", "k2", "dkim", "mail", "smtp", "mx", "s1", "s2",
+    "zendesk", "sendgrid", "sg", "mg", "mandrill", "mailgun", "amazonses", "ses",
+    "sparkpost", "postmark", "pm", "brevo", "sendinblue", "hubspot", "hs1", "hs2",
+    "zoho", "zmail", "outlook", "microsoft", "ms", "o365", "office365",
+    "gmail", "workspace", "googleworkspace",
+    "mailer", "newsletter", "news", "campaign", "bulk", "bounce", "transactional",
+    "pmta", "mta", "relay", "postfix", "exim", "qmail", "smtp1", "smtp2",
+    "dkim1", "dkim2", "dkim3",
     local
   ]
 
@@ -164,8 +189,53 @@ function buildSelectorList(domain) {
   return uniq([...common, ...numbered]).slice(0, 100)
 }
 
+function estimateDkimKeyStrength(record) {
+  const tags = parseTags(record)
+  const p = tags.p || ""
+
+  if (!p) {
+    return {
+      bitsEstimate: null,
+      rating: "unknown",
+      note: "public key not found"
+    }
+  }
+
+  const len = p.replace(/\s+/g, "").length
+
+  if (len >= 680) {
+    return {
+      bitsEstimate: 4096,
+      rating: "strong",
+      note: "estimated from public key length"
+    }
+  }
+
+  if (len >= 340) {
+    return {
+      bitsEstimate: 2048,
+      rating: "good",
+      note: "estimated from public key length"
+    }
+  }
+
+  if (len >= 170) {
+    return {
+      bitsEstimate: 1024,
+      rating: "weak",
+      note: "estimated from public key length"
+    }
+  }
+
+  return {
+    bitsEstimate: null,
+    rating: "unknown",
+    note: "could not estimate key size reliably"
+  }
+}
+
 async function findDkim(domain) {
-  const selectors = buildSelectorList(domain)
+  const selectors = buildSelectors(domain)
 
   for (const s of selectors) {
     const host = `${s}._domainkey.${domain}`
@@ -178,12 +248,14 @@ async function findDkim(domain) {
           joined.toLowerCase().includes("k=rsa") ||
           joined.toLowerCase().includes("p=")
         ) {
+          const tags = parseTags(joined)
           return {
             found: true,
             selector: s,
             host,
             record: joined,
-            tags: parseTags(joined),
+            tags,
+            keyStrength: estimateDkimKeyStrength(joined),
             triedCount: selectors.indexOf(s) + 1
           }
         }
@@ -197,7 +269,39 @@ async function findDkim(domain) {
     host: null,
     record: "",
     tags: null,
+    keyStrength: {
+      bitsEstimate: null,
+      rating: "unknown",
+      note: "dkim not found"
+    },
     triedCount: selectors.length
+  }
+}
+
+/* -----------------------------
+ MX / RBL
+------------------------------*/
+
+async function resolveMxSmart(domain) {
+  const domainsToTry = [domain, extractRootDomain(domain)]
+
+  for (const d of domainsToTry) {
+    try {
+      const mx = await dns.resolveMx(d)
+      if (mx.length > 0) {
+        return {
+          found: true,
+          domain: d,
+          mx
+        }
+      }
+    } catch (e) {}
+  }
+
+  return {
+    found: false,
+    domain: null,
+    mx: []
   }
 }
 
@@ -287,6 +391,185 @@ async function resolveMxIps(mxHosts) {
   return out
 }
 
+/* -----------------------------
+ DMARC
+------------------------------*/
+
+function parseDmarcRua(record) {
+  const m = String(record).match(/rua=([^;]+)/i)
+  if (!m) return []
+  return m[1]
+    .split(",")
+    .map(v => v.trim())
+    .filter(Boolean)
+}
+
+function parseDmarcRuf(record) {
+  const m = String(record).match(/ruf=([^;]+)/i)
+  if (!m) return []
+  return m[1]
+    .split(",")
+    .map(v => v.trim())
+    .filter(Boolean)
+}
+
+/* -----------------------------
+ HTTPS fetch for MTA-STS
+------------------------------*/
+
+function fetchText(url, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const req = https.get(url, { timeout: timeoutMs }, (res) => {
+      let data = ""
+      res.on("data", chunk => {
+        data += chunk
+      })
+      res.on("end", () => {
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          body: data
+        })
+      })
+    })
+
+    req.on("error", (e) => {
+      resolve({
+        ok: false,
+        status: 0,
+        body: "",
+        error: String(e.message || e)
+      })
+    })
+
+    req.on("timeout", () => {
+      req.destroy()
+      resolve({
+        ok: false,
+        status: 0,
+        body: "",
+        error: "timeout"
+      })
+    })
+  })
+}
+
+/* -----------------------------
+ SMTP TLS handshake
+------------------------------*/
+
+function smtpTlsProbe(host, port = 25, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const socket = tls.connect(
+      {
+        host,
+        port,
+        servername: host,
+        rejectUnauthorized: false,
+        timeout: timeoutMs
+      },
+      () => {
+        const cert = socket.getPeerCertificate?.() || null
+        socket.end()
+
+        resolve({
+          ok: true,
+          host,
+          port,
+          protocol: socket.getProtocol?.() || null,
+          cipher: socket.getCipher?.() || null,
+          authorized: socket.authorized,
+          authorizationError: socket.authorizationError || null,
+          certificateSubject: cert?.subject || null,
+          certificateIssuer: cert?.issuer || null,
+          valid_from: cert?.valid_from || null,
+          valid_to: cert?.valid_to || null,
+          note: "implicit TLS probe succeeded"
+        })
+      }
+    )
+
+    socket.on("error", (e) => {
+      resolve({
+        ok: false,
+        host,
+        port,
+        error: String(e.message || e),
+        note: "TLS probe failed; common on serverless or if host expects STARTTLS only"
+      })
+    })
+
+    socket.on("timeout", () => {
+      socket.destroy()
+      resolve({
+        ok: false,
+        host,
+        port,
+        error: "timeout",
+        note: "TLS probe timed out"
+      })
+    })
+  })
+}
+
+async function testSmtpTls(mxResolved, tlsRpt, mtaSts) {
+  if (!mxResolved || mxResolved.length === 0) {
+    return {
+      checked: false,
+      supported: false,
+      mode: "not-run",
+      note: "no MX hosts found",
+      probes: []
+    }
+  }
+
+  const probes = []
+  const targets = mxResolved.slice(0, 2)
+
+  for (const mx of targets) {
+    const host = mx.exchange
+
+    // Try 465 first as pure TLS, then 25 as opportunistic attempt.
+    const p465 = await smtpTlsProbe(host, 465, 4000)
+    probes.push(p465)
+    if (p465.ok) {
+      return {
+        checked: true,
+        supported: true,
+        mode: "live-tls-probe",
+        note: "TLS handshake succeeded on port 465",
+        probes
+      }
+    }
+
+    const p25 = await smtpTlsProbe(host, 25, 4000)
+    probes.push(p25)
+    if (p25.ok) {
+      return {
+        checked: true,
+        supported: true,
+        mode: "live-tls-probe",
+        note: "TLS handshake succeeded on port 25",
+        probes
+      }
+    }
+  }
+
+  return {
+    checked: true,
+    supported: Boolean(tlsRpt || mtaSts),
+    mode: "dns-fallback",
+    note: (tlsRpt || mtaSts)
+      ? "live probe failed, but DNS signals indicate mail TLS policy/reporting exists"
+      : "live probe failed and no DNS TLS policy/reporting found",
+    probes
+  }
+}
+
+/* -----------------------------
+ Deliverability Score
+------------------------------*/
+
 function scoreMailSecurity(data) {
   let score = 0
   const notes = []
@@ -294,41 +577,48 @@ function scoreMailSecurity(data) {
   if (data.spf) score += 15
   else notes.push("SPF missing")
 
-  if (data.dkim) score += 20
+  if (data.dkim) score += 18
   else notes.push("DKIM missing")
 
-  if (data.dmarc) score += 20
+  if (data.dmarc) score += 18
   else notes.push("DMARC missing")
 
   if (data.dmarc) {
     if (data.dmarcPolicy === "none") {
-      score += 5
+      score += 4
       notes.push("DMARC policy is monitoring only")
     } else if (data.dmarcPolicy === "quarantine") {
-      score += 10
+      score += 8
     } else if (data.dmarcPolicy === "reject") {
-      score += 15
+      score += 12
     }
   }
 
-  if (data.spfRecursive?.found && !data.spfRecursive.warning) score += 10
+  if (data.spfRecursive?.found && !data.spfRecursive.warning) score += 8
   else if (data.spfRecursive?.warning) notes.push("SPF lookup count exceeds 10")
 
-  if (data.dmarcAlignment?.overall) score += 10
+  if (data.dmarcAlignment?.overall) score += 8
   else notes.push("DMARC alignment not fully satisfied")
 
   if (data.mx) score += 5
   else notes.push("MX missing")
 
-  if (data.tlsRpt) score += 5
+  if (data.tlsRpt) score += 4
   if (data.mtaSts) score += 5
-  if (data.bimi) score += 5
+  if (data.bimi) score += 4
 
   if (!data.blacklist) score += 5
   else notes.push("RBL listing detected on MX IP")
 
+  if (data.dkimKeyStrength?.bitsEstimate >= 2048) score += 5
+  else if (data.dkim && data.dkimKeyStrength?.bitsEstimate === 1024) notes.push("DKIM key appears weak (1024-bit class)")
+  else if (data.dkim) notes.push("DKIM key strength unknown")
+
   if (data.smtpTls?.supported) score += 5
-  else notes.push("SMTP TLS test not confirmed")
+  else notes.push("SMTP TLS not confirmed")
+
+  if (data.rua?.length > 0) score += 3
+  else if (data.dmarc) notes.push("DMARC rua not configured")
 
   if (score > 100) score = 100
   if (score < 0) score = 0
@@ -341,6 +631,52 @@ function scoreMailSecurity(data) {
   return { score, grade, notes }
 }
 
+function buildDeliverabilityScore(data) {
+  let score = 0
+  const reasons = []
+
+  if (data.spf) score += 20
+  else reasons.push("SPF missing")
+
+  if (data.dkim) score += 20
+  else reasons.push("DKIM missing")
+
+  if (data.dmarc) score += 20
+  else reasons.push("DMARC missing")
+
+  if (data.dmarcPolicy === "reject") score += 10
+  else if (data.dmarcPolicy === "quarantine") score += 6
+  else if (data.dmarcPolicy === "none") reasons.push("DMARC policy not enforcing")
+
+  if (data.blacklist) {
+    reasons.push("RBL listing detected")
+  } else {
+    score += 10
+  }
+
+  if (data.smtpTls?.supported) score += 8
+  else reasons.push("SMTP TLS not confirmed")
+
+  if (data.mtaSts) score += 4
+  if (data.tlsRpt) score += 4
+  if (data.bimi) score += 4
+
+  if (data.spfRecursive?.warning) reasons.push("SPF lookup budget too high")
+
+  if (score > 100) score = 100
+
+  let label = "Poor"
+  if (score >= 85) label = "Excellent"
+  else if (score >= 70) label = "Good"
+  else if (score >= 55) label = "Fair"
+
+  return { score, label, reasons }
+}
+
+/* -----------------------------
+ main
+------------------------------*/
+
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
@@ -348,7 +684,6 @@ export default async function handler(req, res) {
     }
 
     const domain = safeLower(req.body?.domain)
-
     if (!domain) {
       return res.status(400).json({ error: "domain required" })
     }
@@ -366,11 +701,14 @@ export default async function handler(req, res) {
     let dkimHost = null
     let dkimRecord = ""
     let dkimTags = null
+    let dkimKeyStrength = null
     let dkimTriedCount = 0
 
     let dmarc = false
     let dmarcRecord = ""
     let dmarcPolicy = "none"
+    let rua = []
+    let ruf = []
     let dmarcAlignment = {
       spfAligned: false,
       dkimAligned: false,
@@ -379,6 +717,7 @@ export default async function handler(req, res) {
     }
 
     let mx = false
+    let mxFoundOn = null
     let mxHosts = []
     let mxResolved = []
 
@@ -391,12 +730,12 @@ export default async function handler(req, res) {
     let mtaSts = false
     let mtaStsRecord = ""
     const mtaStsPolicyUrl = `https://mta-sts.${domain}/.well-known/mta-sts.txt`
-
-    let smtpTls = {
-      checked: false,
-      supported: false,
-      mode: "dns-inferred",
-      note: "live SMTP handshake is not reliable on Vercel serverless"
+    let mtaStsPolicy = {
+      fetched: false,
+      ok: false,
+      status: 0,
+      body: "",
+      parsed: null
     }
 
     // SPF basic
@@ -406,13 +745,14 @@ export default async function handler(req, res) {
       if (rec) {
         spf = true
         spfRecord = rec
-        spfLookups = countDirectSpfLookups(rec)
+        spfLookups = countSpfLookups(rec)
       }
     } catch (e) {}
 
     // SPF recursive
     spfRecursive = await resolveSpfRecursive(domain)
     if (spfRecursive?.found) {
+      spf = true
       spfLookupWarning = spfRecursive.warning
       if (!spfRecord) spfRecord = spfRecursive.record
       if (!spfLookups) spfLookups = spfRecursive.totalLookups
@@ -425,6 +765,7 @@ export default async function handler(req, res) {
     dkimHost = dkimFound.host
     dkimRecord = dkimFound.record
     dkimTags = dkimFound.tags
+    dkimKeyStrength = dkimFound.keyStrength
     dkimTriedCount = dkimFound.triedCount
 
     // DMARC
@@ -436,21 +777,19 @@ export default async function handler(req, res) {
         dmarcRecord = rec
         const m = rec.match(/p=([^;]+)/i)
         if (m) dmarcPolicy = safeLower(m[1])
+        rua = parseDmarcRua(rec)
+        ruf = parseDmarcRuf(rec)
       }
     } catch (e) {}
 
     // MX
-    try {
-      const mxRecords = await dns.resolveMx(domain)
-      if (mxRecords.length > 0) {
-        mx = true
-        mxHosts = mxRecords
-          .sort((a, b) => a.priority - b.priority)
-          .map(r => ({ exchange: r.exchange, priority: r.priority }))
-      }
-    } catch (e) {}
+    const mxResult = await resolveMxSmart(domain)
+    mx = mxResult.found
+    mxFoundOn = mxResult.domain
+    mxHosts = mxResult.mx
+      .sort((a, b) => a.priority - b.priority)
+      .map(r => ({ exchange: r.exchange, priority: r.priority }))
 
-    // MX -> IP -> RBL
     if (mxHosts.length > 0) {
       mxResolved = await resolveMxIps(mxHosts)
     }
@@ -495,26 +834,44 @@ export default async function handler(req, res) {
       }
     } catch (e) {}
 
-    // SMTP TLS inferred
-    if (mtaSts || tlsRpt || mx) {
-      smtpTls = {
-        checked: true,
-        supported: Boolean(mtaSts || tlsRpt),
-        mode: "dns-inferred",
-        note: mtaSts || tlsRpt
-          ? "DNS signals indicate TLS mail transport policy/reporting is configured"
-          : "MX exists but no DNS TLS policy/reporting detected"
+    // MTA-STS policy fetch
+    const policyFetch = await fetchText(mtaStsPolicyUrl, 5000)
+    if (policyFetch.ok) {
+      const body = policyFetch.body || ""
+      const parsed = parseTags(body.replace(/\n/g, ";"))
+      mtaStsPolicy = {
+        fetched: true,
+        ok: true,
+        status: policyFetch.status,
+        body,
+        parsed
+      }
+    } else {
+      mtaStsPolicy = {
+        fetched: true,
+        ok: false,
+        status: policyFetch.status || 0,
+        body: "",
+        parsed: null,
+        error: policyFetch.error || null
       }
     }
 
+    // SMTP TLS
+    const smtpTls = await testSmtpTls(mxResolved, tlsRpt, mtaSts)
+
+    // Provider readiness
     const gmailPass = spf && dmarc && (dkim || spf)
     const outlookPass = spf && dmarc && (dkim || spf)
 
+    // Scoring
     const scoreObj = scoreMailSecurity({
       spf,
       dkim,
+      dkimKeyStrength,
       dmarc,
       dmarcPolicy,
+      rua,
       spfRecursive,
       dmarcAlignment,
       mx,
@@ -523,6 +880,19 @@ export default async function handler(req, res) {
       bimi,
       blacklist,
       smtpTls
+    })
+
+    const deliverability = buildDeliverabilityScore({
+      spf,
+      dkim,
+      dmarc,
+      dmarcPolicy,
+      blacklist,
+      smtpTls,
+      mtaSts,
+      tlsRpt,
+      bimi,
+      spfRecursive
     })
 
     return res.status(200).json({
@@ -540,14 +910,18 @@ export default async function handler(req, res) {
       dkimHost,
       dkimRecord,
       dkimTags,
+      dkimKeyStrength,
       dkimTriedCount,
 
       dmarc,
       dmarcRecord,
       dmarcPolicy,
+      rua,
+      ruf,
       dmarcAlignment,
 
       mx,
+      mxFoundOn,
       mxHosts,
       mxResolved,
 
@@ -560,6 +934,7 @@ export default async function handler(req, res) {
       mtaSts,
       mtaStsRecord,
       mtaStsPolicyUrl,
+      mtaStsPolicy,
 
       smtpTls,
 
@@ -570,7 +945,11 @@ export default async function handler(req, res) {
 
       securityScore: scoreObj.score,
       securityGrade: scoreObj.grade,
-      securityNotes: scoreObj.notes
+      securityNotes: scoreObj.notes,
+
+      deliverabilityScore: deliverability.score,
+      deliverabilityLabel: deliverability.label,
+      deliverabilityReasons: deliverability.reasons
     })
   } catch (e) {
     return res.status(500).json({
